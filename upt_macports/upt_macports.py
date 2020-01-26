@@ -5,6 +5,7 @@ import pkg_resources
 import json
 import requests
 import os
+import re
 import subprocess
 import sys
 from packaging.specifiers import SpecifierSet
@@ -237,6 +238,169 @@ class MacPortsRubyPackage(MacPortsPackage):
             return f'https://rubygems.org/gems/{self.upt_pkg.name}'
 
 
+class DependsUpdater(object):
+    valid_types = {
+        # upt phase -> macports phase
+        'test': 'test',
+        'run': 'lib',
+        'build': 'build',
+    }
+
+    def __init__(self, type_):
+        self._in_section = False
+        self.type_ = type_
+        self._keyword = f'depends_{self.valid_types[self.type_]}-append'
+        # We remember the indentation before self._keyword, and the indentation
+        # of the following lines, so that no "whitespace changes" are
+        # introduced. We also remember what the spacing was after the keyword,
+        # since sometimes multiple spaces are used for pretty printing.
+        self._first_line_indent = ''
+        self._next_lines_indent = ''
+        self._space = ' '
+
+        # The dependencies handled by this Updater. At first, this list is
+        # populated through process_line(), so that it holds dependencies
+        # already in the Portfile. It is then modified by update() and holds
+        # the dependencies that are going to be written to the updated
+        # Portfile.
+        self.deps = []
+
+    @staticmethod
+    def _clean_depends_line(line):
+        if line.endswith('\n'):
+            line = line[:-1]
+        if line.endswith('\\'):
+            line = line[:-1]
+        return line.strip()
+
+    def process_line(self, line):
+        matched = False
+        finished = False
+        m = re.match(f'(\s*){self._keyword}(\s+)(.*\n)', line)  # noqa
+        if m:
+            self._in_section = True
+            self._first_line_indent = m.group(1)
+            self._space = m.group(2)
+            line = m.group(3)
+        if self._in_section:
+            matched = True
+            m = re.match(r'(\s+)', line)
+            if m:
+                self._next_lines_indent = m.group(1)
+            self.deps.append(self._clean_depends_line(line))
+            if not line.endswith('\\\n'):
+                self._in_section = False
+                finished = True
+        return matched, finished
+
+    def update(self, pdiff, reqformat_fn):
+        # First, remove old requirements that are no longer required.
+        for deleted_req in pdiff.deleted_requirements(self.type_):
+            formatted_req = f'port:{reqformat_fn(deleted_req)}'
+            try:
+                self.deps.remove(formatted_req)
+            except ValueError:
+                # This particular requirement is no longer marked as needed
+                # upstream. Maybe it was never included in the Makefile, which
+                # means that trying to remove it may raise this exception.
+                pass
+
+        # Then, add new requirements.
+        # Some of the new requirements may already be in the Portfile. This
+        # happens when upstream failed to properly specify metadata in the old
+        # version and fixed everything in the new one:
+        #
+        # Old upstream metadata: "required: []" (even though 'foo' is needed)
+        # New upstream metadata: "required: ['foo']"
+        #
+        # In this case, upt will consider that 'foo' is a new requirement.
+        # Since it was already required in the old version (even though that
+        # was not specified in the metadata), the dependency on 'foo' will
+        # already be specified in the Portfile. We need to make sure that we do
+        # not duplicate this dependency, hence the if condition in the loop.
+        for req in pdiff.new_requirements(self.type_):
+            formatted_req = f'port:{reqformat_fn(req)}'
+            if formatted_req not in self.deps:
+                self.deps.append(formatted_req)
+
+    def build_depends_line(self):
+        if self._next_lines_indent == '':
+            self._next_lines_indent = self._first_line_indent
+            self._next_lines_indent += ' ' * len(self._keyword)
+            self._next_lines_indent += self._space
+        if self.deps:
+            new_depends = f'{self._first_line_indent}{self._keyword}'
+            if not self.deps[0]:
+                new_depends += ' ' * (len(self._space) - 1)
+            else:
+                new_depends += self._space
+            new_depends += ' \\\n'.join([
+                dep if i == 0
+                else f'{self._next_lines_indent}{dep}'
+                for i, dep in enumerate(self.deps)
+            ])
+            new_depends += '\n'
+        else:
+            new_depends = ''
+        return new_depends
+
+
+class DependsUpdaterManager(object):
+    '''A manager for all our DependsUpdater objects.
+
+    Conceptually, DependsUpdaterManager is an improved "for loop" over the
+    various DependsUpdater objects that are needed to update a Portfile. Users
+    should use this class instead of using DependsUpdater objects directly.
+    '''
+    def __init__(self, pdiff, reqformat_fn):
+        self._pdiff = pdiff  # A upt.PackageDiff
+        self._reqformat_fn = reqformat_fn  # Requirement-formatting function
+        self._depends_updaters = [
+            DependsUpdater(type_)
+            for type_ in DependsUpdater.valid_types.keys()
+        ]
+
+    def process_line(self, line):
+        '''Processes a line from an existing Portfile.
+
+        Returns two values:
+        - the first one is a boolean indicating whether the given line was part
+          of a "depends" block;
+        - the second one is a string equal to the updated depends block. It is
+          returned when the given line was the last one of a depends block;
+          otherwise, we return None.
+
+        Example: consider the following three calls, run one after the other.
+        Upstream, the build dependencies have gone from "foo and bar" to just
+        "bar".
+
+        process_line('version 13.37') -> False, None
+        process_line('depends_build-append port:foo \\') -> True, None
+        process_line('    port:bar') -> True, 'depends_build-append port:bar')
+        '''
+        matched = False
+        text = None
+        for updater in self._depends_updaters:
+            matched, finished = updater.process_line(line)
+            if matched:
+                break
+        if matched and finished:
+            self._depends_updaters.remove(updater)
+            updater.update(self._pdiff, self._reqformat_fn)
+            text = updater.build_depends_line()
+        return matched, text
+
+    def flush(self):
+        '''Return the depends blocks that have not been returned yet.'''
+        ret = ''
+        for depends_updater in self._depends_updaters:
+            depends_updater.update(self._pdiff, self._reqformat_fn)
+            depends_line = depends_updater.build_depends_line()
+            if depends_line:
+                ret += depends_line
+        return ret
+
+
 class MacPortsBackend(upt.Backend):
     def __init__(self):
         self.logger = logging.getLogger('upt')
@@ -328,3 +492,113 @@ class MacPortsBackend(upt.Backend):
                  self.standardize_CPAN_version(dep.version) for dep in s])
 
         return super().needs_requirement(req, phase)
+
+    @staticmethod
+    def _update_version(line, old_version, new_version):
+        m = re.match(r'^(version|github.setup|ruby.setup)', line)
+        if m:
+            line = line.replace(old_version, new_version)
+        return line
+
+    @staticmethod
+    def _update_revision(line):
+        m = re.match(r'^revision(\s+)(\d+)\n', line)
+        if m:
+            line = f'revision{m.group(1)}0\n'
+        return line
+
+    @staticmethod
+    def _update_archives(line, old_archive, new_archive):
+        if old_archive is None or new_archive is None:
+            return line
+
+        # Update sha256/rmd160 hashes
+        m = re.match(r'^(.*)(sha256|rmd160)(\s+)[0-9a-f]{40,64}(.*)', line,
+                     re.DOTALL)
+        if m:
+            hash_ = getattr(new_archive, m.group(2))
+            return f'{m.group(1)}{m.group(2)}{m.group(3)}{hash_}{m.group(4)}'
+
+        # Update archive size
+        m = re.match(r'^(.*)size(\s+)\d+(.*)', line, re.DOTALL)
+        if m:
+            size = new_archive.size
+            return f'{m.group(1)}size{m.group(2)}{size}{m.group(3)}'
+
+        # This line had nothing to do with the archives, let's return it as is.
+        return line
+
+    def current_version(self, frontend, pkgname, output=None):
+        self.frontend = frontend.name
+        try:
+            return self.package_versions(pkgname)[0]
+        except:  # noqa
+            return super().current_version(frontend, pkgname, output=output)
+
+    def _update_portfile_content(self, portfile_handle, pdiff):
+        macports_pkg = self.pkg_classes[self.frontend]()
+        try:
+            archive_format = macports_pkg.archive_format
+            old_archive = pdiff.old.get_archive(archive_format)
+            new_archive = pdiff.new.get_archive(archive_format)
+        except upt.ArchiveUnavailable:
+            old_archive = None
+            new_archive = None
+
+        dum = DependsUpdaterManager(pdiff, macports_pkg.jinja2_reqformat)
+        new_lines = []
+        for line in portfile_handle:
+            # Update depends_{build,lib,test}-append
+            in_depends_block, new_depends_block = dum.process_line(line)
+            if in_depends_block:
+                # This line is part of a depends block.
+                if new_depends_block:
+                    # If we get here, this line was the last one of the
+                    # depends block, and process_line() returned the
+                    # updated depends block.
+                    line = new_depends_block
+                else:
+                    # We are not at the end of the current depends block
+                    # yet, so we must keep looping and refrain from
+                    # appending anything to new_lines yet.
+                    continue  # pragma: nocover
+            else:
+                # We make the assumption that only one of the following
+                # function calls will affect the current line.
+                line = self._update_version(line,
+                                            pdiff.old_version,
+                                            pdiff.new_version)
+                line = self._update_revision(line)
+                line = self._update_archives(line, old_archive,
+                                             new_archive)
+            # We make sure to remember the updated line (which may actually
+            # be multiple lines concatenated into a single string if we
+            # were parsing a block of lines).
+            new_lines.append(line)
+
+        # If a "depends" line was not used in the original Portfile, the
+        # corresponding DependsUpdater object will not have been used by
+        # now, even though there may be new dependencies for the project.
+        # Let's use this DependsUpdater object here and try to insert the
+        # dependencies as cleanly as possible.
+        depends_line = dum.flush()
+        if depends_line:
+            new_lines.append('#TODO: Move this\n')
+            new_lines.append(depends_line)
+        return ''.join(new_lines)
+
+    def update_package(self, pdiff, output=None):
+        macports_pkg = self.pkg_classes[self.frontend]()
+
+        # TODO: This is basically the same code as the one found in
+        # MacPortsPackage._create_output_directories(). It would be nice not to
+        # repeat ourselves.
+        folder_name = macports_pkg._normalized_macports_folder(pdiff.new.name)
+        output_dir = os.path.join(macports_pkg.category, folder_name)
+        portfile_path = f'{output_dir}/Portfile'
+
+        with open(portfile_path, 'r+') as f:
+            new_portfile_content = self._update_portfile_content(f, pdiff)
+            f.seek(0)
+            f.write(new_portfile_content)
+            f.truncate()
